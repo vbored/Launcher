@@ -27,6 +27,20 @@ final class WallpaperBackgroundCache {
     private var lastPrewarmedScreen: NSScreen?
     private var wallpaperChangeSource: DispatchSourceFileSystemObject?
     private var pendingChangeWorkItem: DispatchWorkItem?
+    // Belt-and-suspenders alongside the file watcher below: `watchWallpaperStore`
+    // depends on a private, undocumented file path that's only confirmed
+    // correct for the macOS versions it was directly inspected against — if
+    // it's wrong for some other version (or Apple moves the file again),
+    // the watcher silently never fires (`open` just returns -1) and the
+    // cache would never invalidate at all. Comparing against the *public*
+    // `NSWorkspace.desktopImageURL(for:)` every time `prewarm` is called —
+    // i.e. every toggle-open — can't be broken by a macOS version mismatch
+    // the same way, so it catches a changed static wallpaper even if the
+    // file watcher above never worked. (It can't see a change *between* two
+    // procedural/animated wallpapers, which both report the same generic
+    // system fallback URL — the file watcher, when it does work, is what
+    // covers that case.)
+    private var lastKnownWallpaperURL: URL?
 
     private static let wallpaperStorePath = NSString(
         string: "~/Library/Application Support/com.apple.wallpaper/Store/Index.plist"
@@ -98,12 +112,38 @@ final class WallpaperBackgroundCache {
         cachedImage
     }
 
+    private var pendingCompletions: [@MainActor (NSImage) -> Void] = []
+
     /// Kicks off background rendering if nothing is cached yet and no
     /// computation is already in flight. `completion` (if given) fires on
-    /// the main actor once a fresh image is ready.
+    /// the main actor once a fresh image is ready — immediately, if one is
+    /// already cached.
     func prewarm(for screen: NSScreen, completion: (@MainActor (NSImage) -> Void)? = nil) {
         lastPrewarmedScreen = screen
-        guard cachedImage == nil, !isComputing else { return }
+
+        let currentURL = NSWorkspace.shared.desktopImageURL(for: screen)
+        if let lastKnownWallpaperURL, currentURL != lastKnownWallpaperURL {
+            cachedImage = nil
+        }
+        lastKnownWallpaperURL = currentURL
+
+        if let cachedImage {
+            completion?(cachedImage)
+            return
+        }
+
+        if let completion {
+            pendingCompletions.append(completion)
+        }
+        // A caller arriving while a render is already in flight (e.g. a
+        // toggle-open landing right after a wallpaper-change invalidation
+        // kicked off its own re-render) used to just drop its completion
+        // here and never hear back at all — silently leaving whatever was
+        // on screen stale until some *later*, unrelated event happened to
+        // trigger another render. Queuing it above instead means every
+        // caller gets notified once the in-flight render actually finishes,
+        // no matter how many are waiting on the same one.
+        guard !isComputing else { return }
         isComputing = true
 
         // Resolve everything that touches AppKit objects here, on the main
@@ -126,9 +166,11 @@ final class WallpaperBackgroundCache {
             )
             await MainActor.run {
                 self.isComputing = false
+                let waiting = self.pendingCompletions
+                self.pendingCompletions.removeAll()
                 guard let image else { return }
                 self.cachedImage = image
-                completion?(image)
+                waiting.forEach { $0(image) }
             }
         }
     }

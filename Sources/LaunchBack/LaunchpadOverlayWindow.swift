@@ -12,7 +12,14 @@ final class LaunchpadOverlayWindow: NSWindow {
     private var fallbackBlurView: NSVisualEffectView?
     private var hostingView: NSView?
     private let targetFrame: NSRect
+    private let ownerScreen: NSScreen
     private var onRequestDismiss: (() -> Void)?
+    // False only until the very first background image (real or fallback
+    // blur) has been installed. Distinguishes "nothing shown yet, needs a
+    // fallback while the real one renders" from "something's already
+    // showing, so just wait for the update rather than flashing back to a
+    // generic blur every time `refreshBackground` re-checks."
+    private var hasDisplayedBackground = false
 
     // Bumped on every `show()`/`dismiss()` call and captured by `dismiss()`'s
     // animation completion handler. Reusing one window instance across
@@ -39,6 +46,7 @@ final class LaunchpadOverlayWindow: NSWindow {
 
     init(screen: NSScreen) {
         targetFrame = screen.frame
+        ownerScreen = screen
         super.init(
             contentRect: screen.frame,
             styleMask: [.borderless],
@@ -59,26 +67,35 @@ final class LaunchpadOverlayWindow: NSWindow {
 
         backgroundContainer.frame = screen.frame
         backgroundContainer.autoresizingMask = [.width, .height]
-
-        // `WallpaperBackgroundCache` renders the blurred wallpaper off the
-        // main thread and reuses the result across every toggle-open —
-        // computing it fresh (and, worse, letting `NSCIImageRep` rasterize
-        // it lazily on first draw) used to freeze the open/close animation
-        // for up to a second on every single open. If nothing's cached yet
-        // (the very first open of the session), fall back instantly to a
-        // live behind-window blur — a plausibly-colored, slightly-wrong
-        // backdrop beats blocking the animation — and swap in the accurate
-        // image the moment the background render finishes.
-        if let wallpaper = WallpaperBackgroundCache.shared.cachedBackground() {
-            addBackgroundImage(wallpaper)
-        } else {
-            addFallbackBlur()
-            WallpaperBackgroundCache.shared.prewarm(for: screen) { [weak self] wallpaper in
-                self?.addBackgroundImage(wallpaper)
-            }
-        }
+        refreshBackground(for: screen)
 
         contentView = backgroundContainer
+    }
+
+    /// Installs whatever background is currently available, and asks the
+    /// cache for an update. Called once from `init` and again on every
+    /// `show(with:)` — that second call site is what actually lets a
+    /// wallpaper change reach an already-open (reused-across-toggles)
+    /// window: `init` alone only ever runs once per screen for the whole
+    /// app session, so a cache invalidation that happened while this window
+    /// already existed would otherwise have nowhere to deliver its result.
+    private func refreshBackground(for screen: NSScreen) {
+        let cache = WallpaperBackgroundCache.shared
+
+        // Only fall back to the generic blur if nothing has ever been shown
+        // yet — once a real (or even fallback) background is up, re-running
+        // this on a later `show()` should wait quietly for `prewarm`'s
+        // completion rather than flashing back to the placeholder while a
+        // post-wallpaper-change re-render is in flight.
+        if !hasDisplayedBackground, cache.cachedBackground() == nil {
+            addFallbackBlur()
+            hasDisplayedBackground = true
+        }
+
+        cache.prewarm(for: screen) { [weak self] wallpaper in
+            self?.addBackgroundImage(wallpaper)
+            self?.hasDisplayedBackground = true
+        }
     }
 
     private func addBackgroundImage(_ image: NSImage) {
@@ -124,6 +141,15 @@ final class LaunchpadOverlayWindow: NSWindow {
         DebugTiming.mark("LaunchpadOverlayWindow.show(with:) entered")
         operationToken += 1
         onRequestDismiss = onDismiss
+
+        // See `refreshBackground` — `init` alone only ever runs once per
+        // screen for this window's whole lifetime (it's reused across
+        // toggles), so this is what actually lets a wallpaper change that
+        // happened while the window already existed reach the screen: a
+        // no-op if the cache still matches what's already displayed, an
+        // instant swap if a freshly re-rendered image is ready and waiting.
+        refreshBackground(for: ownerScreen)
+
         // Defensive: if a previous `dismiss()`'s fade-out animation hasn't
         // finished yet (fast close-then-reopen), its hosting view is still
         // attached — the `operationToken` check in `dismiss()`'s completion
