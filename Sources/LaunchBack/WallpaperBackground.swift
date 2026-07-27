@@ -1,7 +1,6 @@
 import AppKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
-import AVFoundation
 
 /// Caches the blurred wallpaper background across every toggle-open of the
 /// overlay, computed off the main thread.
@@ -41,6 +40,11 @@ final class WallpaperBackgroundCache {
     // system fallback URL — the file watcher, when it does work, is what
     // covers that case.)
     private var lastKnownWallpaperURL: URL?
+    // Same idea, for appearance: a Dynamic Desktop wallpaper (or a picture
+    // with distinct Light/Dark variants) renders a genuinely different
+    // image when the system switches appearance even though the file path
+    // itself never changes — so the URL check above alone can't catch it.
+    private var lastKnownIsDark: Bool?
 
     private static let wallpaperStorePath = NSString(
         string: "~/Library/Application Support/com.apple.wallpaper/Store/Index.plist"
@@ -62,6 +66,32 @@ final class WallpaperBackgroundCache {
         // procedural alike, so a filesystem watcher on it is reliable
         // regardless of what notification (if any) WallpaperAgent posts.
         watchWallpaperStore()
+        watchAppearanceChanges()
+    }
+
+    /// A system-wide (not per-app) light/dark switch — whether by schedule,
+    /// manual toggle, or Night Shift-style automation — doesn't touch the
+    /// wallpaper *file* at all for a Dynamic Desktop or Light/Dark-paired
+    /// picture, so `watchWallpaperStore` alone won't necessarily catch it.
+    /// `AppleInterfaceThemeChangedNotification` is the long-standing
+    /// (unofficial but very widely relied-upon) distributed notification
+    /// macOS posts on exactly this change.
+    private func watchAppearanceChanges() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.cachedImage = nil
+            if let screen = self.lastPrewarmedScreen {
+                self.prewarm(for: screen)
+            }
+        }
+    }
+
+    private func currentAppearanceIsDark() -> Bool {
+        NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
     }
 
     private func watchWallpaperStore() {
@@ -122,10 +152,15 @@ final class WallpaperBackgroundCache {
         lastPrewarmedScreen = screen
 
         let currentURL = NSWorkspace.shared.desktopImageURL(for: screen)
+        let currentIsDark = currentAppearanceIsDark()
         if let lastKnownWallpaperURL, currentURL != lastKnownWallpaperURL {
             cachedImage = nil
         }
+        if let lastKnownIsDark, currentIsDark != lastKnownIsDark {
+            cachedImage = nil
+        }
         lastKnownWallpaperURL = currentURL
+        lastKnownIsDark = currentIsDark
 
         if let cachedImage {
             completion?(cachedImage)
@@ -208,16 +243,31 @@ final class WallpaperBackgroundCache {
 
         // Video-based dynamic wallpapers (macOS's "Aerial"-style landscapes,
         // e.g. the bundled "Tahoe Day.mov") report a plain file URL too, but
-        // it's a movie, not an image — `CIImage(contentsOf:)` can't read it
-        // directly. Grabbing a single frame via `AVAssetImageGenerator` is
-        // still pure file I/O, so it needs no extra permission either.
+        // it's a movie, not an image. These cycle continuously regardless of
+        // light/dark mode, so there's no single frame — light, dark, or
+        // otherwise — that's ever reliably "correct" to freeze on; falling
+        // through to a live desktop snapshot (below, via returning `nil`
+        // here) always matches whatever's actually on screen instead of
+        // guessing.
         if url.pathExtension.lowercased() == "mov" {
-            let asset = AVURLAsset(url: url)
-            let generator = AVAssetImageGenerator(asset: asset)
-            generator.appliesPreferredTrackTransform = true
-            guard let cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil) else { return nil }
-            return CIImage(cgImage: cgImage)
+            return nil
         }
+
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+
+        // A Dynamic Desktop picture — or a picture with distinct Light/Dark
+        // variants — is a *single* file containing multiple embedded
+        // images; which one macOS is actually showing depends on time of
+        // day and/or current appearance, encoded in private per-image
+        // metadata this doesn't attempt to parse. Blindly reading index 0
+        // (as this used to) always grabbed the light/first-in-file frame,
+        // which is why dark mode never rendered correctly. A plain
+        // single-image file (`count == 1`) has no such ambiguity — only
+        // multi-frame files fall through to the live snapshot below, which
+        // reflects whichever frame is actually currently on screen without
+        // needing to decode which one that is.
+        let imageCount = CGImageSourceGetCount(source)
+        guard imageCount == 1 else { return nil }
 
         // Wallpaper source files can be dramatically higher resolution than
         // the screen (observed: a 6016×6016 source backing a 2560×1440
@@ -233,7 +283,6 @@ final class WallpaperBackgroundCache {
         // like HEIC it never materializes the full-resolution bitmap at
         // all, which is the only way to actually avoid paying for those
         // pixels rather than just discarding them after the fact.
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let maxPixelSize = max(targetPixelSize.width, targetPixelSize.height)
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
