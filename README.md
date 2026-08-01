@@ -29,4 +29,8 @@ With permission:
 ![alt text](https://github.com/vbored/Launchback/blob/main/Screenshot1.png)
 
 demo video
-![](demo.mov)
+<video width="600" height="300" controls>
+  <source src="demo.mov" type="video/mp4">
+</video>
+
+
