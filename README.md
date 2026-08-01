@@ -21,7 +21,7 @@ Turn on the toggle for LaunchBack
 Quit and reopen LaunchBack (macOS requires a relaunch for this permission to take effect)
 
 
-Without Persion
+Without permission
 ![alt text](https://github.com/vbored/Launchback/blob/main/screenshot.png)
 
 With permission: 
