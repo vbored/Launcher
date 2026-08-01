@@ -51,7 +51,7 @@ final class WallpaperBackgroundCache {
     ).expandingTildeInPath
 
     private init() {
-        // A long-running LaunchBack session should notice when the wallpaper
+        // A long-running Launcher session should notice when the wallpaper
         // changes instead of keeping a stale cached background until the
         // app is quit and relaunched. There's no *documented* public
         // notification for this — an earlier version of this code guessed

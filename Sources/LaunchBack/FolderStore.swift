@@ -27,7 +27,7 @@ final class FolderStore: ObservableObject {
 
     private static let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("com.bored.launchback", isDirectory: true)
+            .appendingPathComponent("com.bored.launcher", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("folders.json")
     }()
@@ -37,7 +37,7 @@ final class FolderStore: ObservableObject {
     // otherwise a user who deletes the folder, or drags every app back out
     // of it, would just watch it reappear the next time Spotlight's
     // monitor fires.
-    private static let seededUtilitiesKey = "com.bored.launchback.seededUtilitiesFolder"
+    private static let seededUtilitiesKey = "com.bored.launcher.seededUtilitiesFolder"
 
     init() {
         folders = Self.load()
@@ -105,7 +105,7 @@ final class FolderStore: ObservableObject {
 
     // MARK: - Default "Utilities" folder
 
-    /// Runs once per install. If the system Utilities apps LaunchBack
+    /// Runs once per install. If the system Utilities apps Launcher
     /// already discovers (Activity Monitor, Disk Utility, Terminal, and so
     /// on — anything under `/System/Applications/Utilities`) aren't already
     /// sorted into some folder, group them the way classic Launchpad ships

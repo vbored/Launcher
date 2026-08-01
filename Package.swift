@@ -2,13 +2,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "LaunchBack",
+    name: "Launcher",
     platforms: [
         .macOS(.v14)
     ],
     targets: [
         .executableTarget(
-            name: "LaunchBack",
+            name: "Launcher",
             path: "Sources/LaunchBack",
             linkerSettings: [
                 // Carbon.HIToolbox backs the global hotkey (RegisterEventHotKey).

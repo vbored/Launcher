@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 @main
-struct LaunchBackApp: App {
+struct LauncherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
@@ -28,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // /System/Applications/Launchpad.app/Contents/MacOS/Launchpad. Listening
     // for it too means any leftover system trigger for "toggle Launchpad"
     // (an F4 remap, `tell application "Launchpad" to activate`, etc.) also
-    // opens LaunchBack, at no cost if nothing ever posts it.
+    // opens Launcher, at no cost if nothing ever posts it.
     private static let legacyLaunchpadToggleName = Notification.Name("com.apple.launchpad.toggle")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -39,7 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // reclaim memory during a long idle period (confirmed via `log
         // show`: this process was tagged
         // `_kLSApplicationWouldBeTerminatedByTALKey=1`, i.e. eligible).
-        // LaunchBack has no visible window almost all the time by design —
+        // Launcher has no visible window almost all the time by design —
         // it's a background accessory app waiting for a hotkey — so it's
         // squarely in the category this targets. If macOS kills it,
         // Launch Services silently relaunches it from scratch the next

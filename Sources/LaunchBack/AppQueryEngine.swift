@@ -25,7 +25,7 @@ final class AppStore: ObservableObject {
 /// filesystem scan. `NSMetadataQuery` posts a notification every time its
 /// result set changes, so installing or deleting an app updates the grid
 /// automatically — including while the overlay is already open — with no
-/// need to reopen LaunchBack for the list to catch up. Confirmed end to end
+/// need to reopen Launcher for the list to catch up. Confirmed end to end
 /// by installing and removing a real test app while monitoring: both showed
 /// up within seconds, with no relaunch.
 @MainActor
@@ -49,7 +49,7 @@ final class AppQueryEngine {
 
     nonisolated private static let cacheURL: URL = {
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("com.bored.launchback", isDirectory: true)
+            .appendingPathComponent("com.bored.launcher", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("apps.json")
     }()

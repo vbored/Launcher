@@ -1,11 +1,11 @@
 #!/bin/bash
 # Builds a Universal 2 (arm64 + x86_64) release binary via SwiftPM and wraps
-# it into a minimal double-clickable LaunchBack.app.
+# it into a minimal double-clickable Launcher.app.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-APP_NAME="LaunchBack"
+APP_NAME="Launcher"
 APP_BUNDLE="$APP_NAME.app"
 
 echo "==> Building universal release binary"

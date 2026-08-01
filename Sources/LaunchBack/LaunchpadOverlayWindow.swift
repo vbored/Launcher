@@ -169,7 +169,7 @@ final class LaunchpadOverlayWindow: NSWindow {
         DebugTiming.mark("after setFrame(zoomedOutFrame)")
         // `activate(ignoringOtherApps:)` is asynchronous, so even calling
         // it before ordering the window doesn't reliably win the race:
-        // `makeKeyAndOrderFront` can still run before LaunchBack is
+        // `makeKeyAndOrderFront` can still run before Launcher is
         // actually marked active, and AppKit then places the window
         // *beneath* whichever app is still active (confirmed via
         // `log show`: "ordered front from a non-active application and
@@ -201,7 +201,7 @@ final class LaunchpadOverlayWindow: NSWindow {
                 self.onRequestDismiss?()
                 return nil
             }
-            // LaunchBack has no Dock icon and no menu bar (`.accessory`
+            // Launcher has no Dock icon and no menu bar (`.accessory`
             // activation policy, by design — it's meant to be invisible
             // until summoned), so there's normally no "Quit" anywhere a
             // user could find without opening Activity Monitor. `⌘Q` is the
