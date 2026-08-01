@@ -123,8 +123,19 @@ final class FolderStore: ObservableObject {
         // Apps still trickling in from the live Spotlight gather — wait for
         // a batch that actually has the Utilities folder's worth of apps in
         // it before deciding there's nothing to seed, rather than locking
-        // in an empty seed off a half-populated first result.
-        guard !apps.isEmpty else { return }
+        // in an empty seed off a half-populated first result. `!apps.isEmpty`
+        // alone wasn't a strong enough check here: it marked the seed done
+        // — permanently, since the flag persists in UserDefaults — the
+        // moment *any* apps had arrived, even a handful from an early,
+        // still-in-progress gather. If that first sighting didn't happen to
+        // include 2+ Utilities apps yet, the folder silently never got
+        // created and this would never get another chance to try again.
+        // Every real Mac has well over a hundred discoverable apps once
+        // gathering genuinely finishes (Utilities alone is normally ~19),
+        // so requiring a real count here — not just "something" — is a safe
+        // way to tell "this is the real, complete list" apart from an
+        // in-progress partial one.
+        guard apps.count >= 40 else { return }
         UserDefaults.standard.set(true, forKey: Self.seededUtilitiesKey)
         guard utilityIDs.count >= 2 else { return }
 

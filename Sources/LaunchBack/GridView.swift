@@ -199,14 +199,16 @@ struct GridView: View {
             // GeometryReader above) so it's sized to the whole overlay, not
             // just the 68%-wide framed content area.
             if let folderID = openFolderID, let folder = folderStore.folders.first(where: { $0.id == folderID }) {
+                let gridContentWidth = gridContainerSize.width * 0.68
                 let (_, folderIconSize) = Self.mainGridMetrics(
-                    contentWidth: gridContainerSize.width * 0.68,
+                    contentWidth: gridContentWidth,
                     columns: columns
                 )
                 FolderDetailView(
                     folder: folder,
                     apps: apps(in: folder),
                     iconSize: folderIconSize,
+                    gridContentWidth: gridContentWidth,
                     launchingID: launchingID,
                     onLaunch: { launch($0) },
                     onRemove: { appID in
@@ -733,6 +735,13 @@ private struct FolderDetailView: View {
     let folder: AppFolder
     let apps: [AppInfo]
     let iconSize: CGFloat
+    // The main grid's own width, as a floor for the panel below — real
+    // Launchpad's folder card is a big, dominant piece of the screen
+    // regardless of how few apps are in the folder; sizing purely off
+    // column-count × iconSize (the previous approach) meant a folder with
+    // only a handful of apps rendered a noticeably small, almost
+    // apologetic little card instead.
+    let gridContentWidth: CGFloat
     let launchingID: String?
     let onLaunch: (AppInfo) -> Void
     let onRemove: (String) -> Void
@@ -743,20 +752,24 @@ private struct FolderDetailView: View {
     @FocusState private var nameFocused: Bool
     @State private var hoveredID: String?
 
-    // Fixed column count (classic Launchpad also wraps folders at a fixed
-    // width rather than reflowing by icon count), but every other
-    // dimension below scales off `iconSize` — which itself matches the
-    // main grid's own icon size for this screen — so the panel comes out
-    // proportional to the display instead of a constant that was only
-    // ever sized against one reference screenshot.
-    private let columns = 5
+    // 7, not 5 — matches classic Launchpad's own folder grid, and reaching
+    // a wider fixed column count is what actually gets the panel up to a
+    // "large like the original" footprint rather than a fixed multiplier
+    // on top of the same column count the main grid already used.
+    private let columns = 7
     private var gridSpacing: CGFloat { iconSize * 0.3 }
     private var labelWidth: CGFloat { iconSize * 1.2 }
     private var panelPadding: CGFloat { iconSize * 0.4 }
     private var titleFontSize: CGFloat { max(20, iconSize * 0.22) }
     private var removeButtonFontSize: CGFloat { max(15, iconSize * 0.16) }
     private var panelMaxWidth: CGFloat {
-        CGFloat(columns) * iconSize + CGFloat(columns - 1) * gridSpacing + panelPadding * 2
+        let contentDriven = CGFloat(columns) * iconSize + CGFloat(columns - 1) * gridSpacing + panelPadding * 2
+        // Never smaller than ~72% of the main grid's own width (capped so
+        // it doesn't run edge-to-edge on an ultra-wide display), and never
+        // smaller than what the icons themselves need if that's larger —
+        // e.g. a folder that somehow has enormous icons on a tiny screen.
+        let screenFloor = min(gridContentWidth * 0.72, 1100)
+        return max(contentDriven, screenFloor)
     }
 
     var body: some View {
