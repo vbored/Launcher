@@ -77,32 +77,6 @@ final class AppQueryEngine {
     func startMonitoring(store: AppStore) {
         guard query == nil else { return }
 
-        // Show last session's app list immediately, before Spotlight has
-        // gathered anything — it's re-verified (icons freshly re-loaded,
-        // not reused from disk) rather than trusted blindly, and gets
-        // replaced the moment the live query actually answers, so a stale
-        // cache (an app installed/removed since last run) only shows
-        // briefly instead of leaving the grid empty the whole time.
-        //
-        // `Task.detached`, not a plain `Task` — a plain `Task` here inherits
-        // this method's `MainActor` context, and profiling (temporary
-        // instrumentation) showed it sitting queued for ~290ms before
-        // actually running: the main run loop was still busy with the
-        // overlay's own open animation at the exact moment this got
-        // scheduled, and a MainActor-bound `Task` has to wait its turn
-        // behind that. None of this work — reading the cache file, loading
-        // icons — needs the main actor at all until the very last step, so
-        // detaching it entirely sidesteps that contention.
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let cachedPaths = Self.loadCachedPaths() else { return }
-            let urls = cachedPaths.map { URL(fileURLWithPath: $0) }
-            let infos = await Self.loadAll(urls: urls)
-            await MainActor.run {
-                guard let self, !self.hasReceivedLiveResults, !infos.isEmpty else { return }
-                store.apps = infos
-            }
-        }
-
         // Uses Spotlight's existing index instead of walking the
         // filesystem. A plain recursive directory walk both misses
         // symlinked bundles — `/Applications/Safari.app` has pointed into a
@@ -113,6 +87,10 @@ final class AppQueryEngine {
         // contributing zero real apps, and was the dominant cost in every
         // scan). Spotlight already resolves the former correctly and only
         // indexes actual application bundles, sidestepping both problems.
+        //
+        // Built (and its observers registered) before the cache-priming
+        // task below, but not `start()`-ed until inside that task — see the
+        // comment down there for why.
         let query = NSMetadataQuery()
         query.predicate = NSPredicate(format: "kMDItemContentType == 'com.apple.application-bundle'")
         // Custom path-array scopes work fine for a one-shot gather, but
@@ -149,18 +127,59 @@ final class AppQueryEngine {
             reason: "Keep the Spotlight app monitor live-updating in the background"
         )
 
-        // `query.start()` itself (not the setup above, which is cheap/no
-        // I/O) is what kicks off Spotlight's actual on-disk gather — and
-        // profiling showed it competing with the cache-priming task above
-        // for disk I/O when both start at once: loading the *same* 126
-        // apps' icons took 86ms in isolation, but 300-700ms when racing
-        // this. A short, deliberate head start lets the cache path — which
-        // is what the user actually sees first — finish largely undisturbed
-        // before Spotlight's heavier gather ramps up. Delaying live results
-        // by a couple hundred milliseconds is imperceptible; racing them
-        // was directly costing the one thing this delay avoids.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            query.start()
+        // Show last session's app list immediately, before Spotlight has
+        // gathered anything — it's re-verified (icons freshly re-loaded,
+        // not reused from disk) rather than trusted blindly, and gets
+        // replaced the moment the live query actually answers, so a stale
+        // cache (an app installed/removed since last run) only shows
+        // briefly instead of leaving the grid empty the whole time.
+        //
+        // `Task.detached`, not a plain `Task` — a plain `Task` here inherits
+        // this method's `MainActor` context, and profiling (temporary
+        // instrumentation) showed it sitting queued for ~290ms before
+        // actually running: the main run loop was still busy with the
+        // overlay's own open animation at the exact moment this got
+        // scheduled, and a MainActor-bound `Task` has to wait its turn
+        // behind that. None of this work — reading the cache file, loading
+        // icons — needs the main actor at all until the very last step, so
+        // detaching it entirely sidesteps that contention.
+        //
+        // Starting Spotlight's own gather (`query.start()`, below) also
+        // happens from inside this same task now, rather than on a fixed
+        // timer independent of it: on a cache-less run — first-ever launch,
+        // or right after this app's bundle identifier changed and the cache
+        // location moved with it — there's nothing for a head start to
+        // protect, and unconditionally waiting a quarter second anyway was
+        // pure dead time stacked directly on top of an already-empty grid,
+        // which is exactly what "slow to show apps" describes. Only the
+        // genuinely-has-a-cache path still gives it that head start.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let cachedPaths = Self.loadCachedPaths() else {
+                await MainActor.run { query.start() }
+                return
+            }
+
+            let urls = cachedPaths.map { URL(fileURLWithPath: $0) }
+            let infos = await Self.loadAll(urls: urls)
+            await MainActor.run {
+                guard let self, !self.hasReceivedLiveResults, !infos.isEmpty else { return }
+                store.apps = infos
+            }
+
+            // `query.start()` itself is what kicks off Spotlight's actual
+            // on-disk gather — and profiling showed it competing with the
+            // cache-priming work above for disk I/O when both start at
+            // once: loading the *same* 126 apps' icons took 86ms in
+            // isolation, but 300-700ms when racing this. This short,
+            // deliberate head start lets the cache path — what the user
+            // actually sees first — finish largely undisturbed before
+            // Spotlight's heavier gather ramps up. Delaying live results by
+            // a couple hundred milliseconds is imperceptible when a cache
+            // is already on screen; it's only free when there's nothing
+            // being protected, which is why the no-cache branch above skips
+            // it entirely instead of applying it unconditionally.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            await MainActor.run { query.start() }
         }
 
         // Belt-and-suspenders re-read on a timer, independent of whether an
