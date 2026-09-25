@@ -2,6 +2,20 @@ import AppKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
 
+// Deliberately a plain top-level global, not a stored property of the
+// (`@MainActor`) `WallpaperBackgroundCache` class below. A property there
+// would construct this — which sets up Core Image's underlying rendering
+// pipeline, not necessarily free — the instant `.shared` is first touched,
+// which happens synchronously on the *main thread*, during the very first
+// `show()` on cold launch: exactly the moment a blank window is what the
+// user is staring at, and exactly the kind of cost the rest of this cache
+// exists to keep off that path. A global `let` initializes lazily on
+// whichever thread first touches it, and it's only ever referenced from
+// inside `Task.detached`'s already-off-main-thread closure below — so that
+// first touch, and whatever it costs, happens in the background instead of
+// blocking the window from appearing.
+private let sharedCIContext = CIContext(options: nil)
+
 /// Caches the blurred wallpaper background across every toggle-open of the
 /// overlay, computed off the main thread.
 ///
@@ -22,7 +36,6 @@ final class WallpaperBackgroundCache {
 
     private var cachedImage: NSImage?
     private var isComputing = false
-    private let ciContext = CIContext(options: nil)
     private var lastPrewarmedScreen: NSScreen?
     private var wallpaperChangeSource: DispatchSourceFileSystemObject?
     private var pendingChangeWorkItem: DispatchWorkItem?
@@ -190,14 +203,12 @@ final class WallpaperBackgroundCache {
             height: screenFrame.height * screen.backingScaleFactor
         )
         let wallpaperURL = NSWorkspace.shared.desktopImageURL(for: screen)
-        let context = ciContext
 
         Task.detached(priority: .userInitiated) {
             let image = Self.renderBackground(
                 wallpaperURL: wallpaperURL,
                 screenFrame: screenFrame,
-                targetPixelSize: targetPixelSize,
-                context: context
+                targetPixelSize: targetPixelSize
             )
             await MainActor.run {
                 self.isComputing = false
@@ -215,14 +226,13 @@ final class WallpaperBackgroundCache {
     private nonisolated static func renderBackground(
         wallpaperURL: URL?,
         screenFrame: NSRect,
-        targetPixelSize: CGSize,
-        context: CIContext
+        targetPixelSize: CGSize
     ) -> NSImage? {
         if let ciImage = staticWallpaperImage(from: wallpaperURL, targetPixelSize: targetPixelSize) {
-            return blurredAndTinted(ciImage, targetPixelSize: targetPixelSize, context: context)
+            return blurredAndTinted(ciImage, targetPixelSize: targetPixelSize)
         }
         if let ciImage = liveDesktopSnapshotImage(screenFrame: screenFrame) {
-            return blurredAndTinted(ciImage, targetPixelSize: targetPixelSize, context: context)
+            return blurredAndTinted(ciImage, targetPixelSize: targetPixelSize)
         }
         return nil
     }
@@ -328,7 +338,7 @@ final class WallpaperBackgroundCache {
         return CIImage(cgImage: cgImage)
     }
 
-    private nonisolated static func blurredAndTinted(_ ciImage: CIImage, targetPixelSize: CGSize, context: CIContext) -> NSImage? {
+    private nonisolated static func blurredAndTinted(_ ciImage: CIImage, targetPixelSize: CGSize) -> NSImage? {
         // Wallpaper *source* images can be dramatically higher resolution
         // than the actual screen — one observed case was a 6016×6016 source
         // for a 2560×1440 display, over 25× more pixels than ever get shown.
@@ -368,7 +378,7 @@ final class WallpaperBackgroundCache {
         // what actually does the expensive work now, off the main thread,
         // instead of leaving it to fire the first time an `NSImageView`
         // draws it later on the main thread.
-        guard let cgImage = context.createCGImage(finalImage, from: downscaled.extent) else { return nil }
+        guard let cgImage = sharedCIContext.createCGImage(finalImage, from: downscaled.extent) else { return nil }
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 }
