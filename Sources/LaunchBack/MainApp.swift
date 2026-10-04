@@ -20,6 +20,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayWindow: LaunchpadOverlayWindow?
     private var hotkeyManager: HotkeyManager?
     private var isVisible = false
+    // Bumped on every open; the persistent `GridView` keys its per-open
+    // reset (search, page, open folder, launch state) off this changing.
+    private var presentationID = 0
     private let appStore = AppStore()
     private let folderStore = FolderStore()
 
@@ -141,7 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window = LaunchpadOverlayWindow(screen: screen)
             overlayWindow = window
         }
-        window.show(with: GridView(store: appStore, folderStore: folderStore, onDismiss: dismissAction), onDismiss: dismissAction)
+        presentationID += 1
+        window.show(
+            with: GridView(store: appStore, folderStore: folderStore, presentationID: presentationID, onDismiss: dismissAction),
+            onDismiss: dismissAction
+        )
         isVisible = true
     }
 

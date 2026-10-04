@@ -32,6 +32,10 @@ private enum LaunchItem: Identifiable, Hashable {
 struct GridView: View {
     @ObservedObject var store: AppStore
     @ObservedObject var folderStore: FolderStore
+    // The hosting view (and so this view's `@State`) now survives across
+    // toggles instead of being rebuilt per open — this changing is what
+    // tells it a new open has started and per-open state should reset.
+    let presentationID: Int
     let onDismiss: () -> Void
 
     @State private var currentPage: Int?
@@ -233,6 +237,7 @@ struct GridView: View {
             recomputePages()
         }
         .onChange(of: folderStore.folders) { recomputePages() }
+        .onChange(of: presentationID) { resetForNewPresentation() }
         .onChange(of: searchText) {
             currentPage = 0
             recomputePages()
@@ -264,6 +269,18 @@ struct GridView: View {
     /// remove).
     private func apps(in folder: AppFolder) -> [AppInfo] {
         folder.appIDs.compactMap { appsByID[$0] }
+    }
+
+    /// What a freshly built `GridView` used to get for free on every open.
+    /// `launchingID` matters most: `launch` refuses to run while it's set,
+    /// so leaving it over from the previous open would block every launch.
+    private func resetForNewPresentation() {
+        openFolderID = nil
+        launchingID = nil
+        hoveredID = nil
+        searchText = ""
+        currentPage = 0
+        searchFocused = true
     }
 
     private func recomputePages() {

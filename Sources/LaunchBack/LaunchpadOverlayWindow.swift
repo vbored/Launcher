@@ -10,7 +10,7 @@ final class LaunchpadOverlayWindow: NSWindow {
     private let backgroundContainer = NSView()
     private var backgroundImageView: NSImageView?
     private var fallbackBlurView: NSVisualEffectView?
-    private var hostingView: NSView?
+    private var hostingView: NSHostingView<GridView>?
     private let targetFrame: NSRect
     private let ownerScreen: NSScreen
     private var onRequestDismiss: (() -> Void)?
@@ -33,16 +33,21 @@ final class LaunchpadOverlayWindow: NSWindow {
     // completion handler recognize it's stale and simply no-op.
     private var operationToken = 0
 
-    /// A slightly inset, centered version of `targetFrame` — the animation
-    /// starts (on show) or ends (on dismiss) here, so the whole overlay
+    /// The overlay starts (on show) or ends (on dismiss) at this scale, so it
     /// gently grows into place / shrinks away instead of just cross-fading,
     /// the same "zoom" feel classic Launchpad opens with.
-    private var zoomedOutFrame: NSRect {
-        let scale: CGFloat = 0.97
-        let dx = targetFrame.width * (1 - scale) / 2
-        let dy = targetFrame.height * (1 - scale) / 2
-        return targetFrame.insetBy(dx: dx, dy: dy)
-    }
+    ///
+    /// This used to be done by animating the *window frame* between a 97%
+    /// inset rect and the full screen. `NSWindow`'s frame animation isn't
+    /// Core Animation — it resizes the real window step by step on the main
+    /// thread, and every step resized the hosting view too, forcing SwiftUI
+    /// to re-run layout for every page of the grid (icon sizes are derived
+    /// from the container width, so each frame was a genuinely new layout).
+    /// That's what made opening visibly drag. The window now stays at its
+    /// full-screen frame and the zoom is a pure GPU transform on the content
+    /// layer, which never triggers layout at all.
+    private static let zoomedOutScale: CGFloat = 0.97
+    private static let zoomAnimationKey = "launcher.zoom"
 
     init(screen: NSScreen) {
         targetFrame = screen.frame
@@ -67,6 +72,7 @@ final class LaunchpadOverlayWindow: NSWindow {
 
         backgroundContainer.frame = screen.frame
         backgroundContainer.autoresizingMask = [.width, .height]
+        backgroundContainer.wantsLayer = true
         refreshBackground(for: screen)
 
         contentView = backgroundContainer
@@ -99,6 +105,11 @@ final class LaunchpadOverlayWindow: NSWindow {
     }
 
     private func addBackgroundImage(_ image: NSImage) {
+        // `prewarm` calls back synchronously with the cached image on every
+        // open — rebuilding a full-screen image view (and re-uploading a
+        // screen-sized texture) for the exact same image each time was pure
+        // waste on the open path.
+        if backgroundImageView?.image === image { return }
         let imageView = NSImageView(frame: backgroundContainer.bounds)
         imageView.autoresizingMask = [.width, .height]
         imageView.imageScaling = .scaleAxesIndependently
@@ -137,7 +148,7 @@ final class LaunchpadOverlayWindow: NSWindow {
     /// the *next* toggle (hotkey, reopen) would try to hide an
     /// already-hidden window and silently do nothing, looking exactly like
     /// a hung/unresponsive app.
-    func show(with rootView: some View, onDismiss: @escaping () -> Void) {
+    func show(with rootView: GridView, onDismiss: @escaping () -> Void) {
         DebugTiming.mark("LaunchpadOverlayWindow.show(with:) entered")
         operationToken += 1
         onRequestDismiss = onDismiss
@@ -150,23 +161,25 @@ final class LaunchpadOverlayWindow: NSWindow {
         // instant swap if a freshly re-rendered image is ready and waiting.
         refreshBackground(for: ownerScreen)
 
-        // Defensive: if a previous `dismiss()`'s fade-out animation hasn't
-        // finished yet (fast close-then-reopen), its hosting view is still
-        // attached — the `operationToken` check in `dismiss()`'s completion
-        // handler will skip *its* cleanup once this newer `show()` has run,
-        // so without this, that old view would linger under the new one
-        // indefinitely rather than just for the remainder of the fade.
-        hostingView?.removeFromSuperview()
-        let hosting = NSHostingView(rootView: rootView)
-        hosting.frame = backgroundContainer.bounds
-        hosting.autoresizingMask = [.width, .height]
-        backgroundContainer.addSubview(hosting)
-        hostingView = hosting
-        DebugTiming.mark("hosting view mounted")
+        // The hosting view is built once and kept for the window's lifetime.
+        // Mounting a fresh one on every open meant SwiftUI rebuilt and laid
+        // out every page of the grid from scratch — every icon, every
+        // gesture modifier — right as the open animation was meant to be
+        // running. Swapping `rootView` instead just diffs against the
+        // already-built tree; `GridView` resets its own per-open state off
+        // the new `presentationID`.
+        if let hostingView {
+            hostingView.rootView = rootView
+        } else {
+            let hosting = NSHostingView(rootView: rootView)
+            hosting.frame = backgroundContainer.bounds
+            hosting.autoresizingMask = [.width, .height]
+            backgroundContainer.addSubview(hosting)
+            hostingView = hosting
+        }
+        DebugTiming.mark("hosting view ready")
 
         alphaValue = 0
-        setFrame(zoomedOutFrame, display: false)
-        DebugTiming.mark("after setFrame(zoomedOutFrame)")
         // `activate(ignoringOtherApps:)` is asynchronous, so even calling
         // it before ordering the window doesn't reliably win the race:
         // `makeKeyAndOrderFront` can still run before Launcher is
@@ -188,11 +201,11 @@ final class LaunchpadOverlayWindow: NSWindow {
         // leaving it on screen, so do the same.
         NSApp.presentationOptions.insert(.hideDock)
 
+        animateZoom(from: Self.zoomedOutScale, to: 1, duration: 0.24, timing: .easeOut, holdAtEnd: false)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.24
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             animator().alphaValue = 1
-            animator().setFrame(targetFrame, display: true)
         }
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
@@ -217,7 +230,42 @@ final class LaunchpadOverlayWindow: NSWindow {
         }
     }
 
-    /// Fades out, tears down the hosted content, and orders the window out.
+    /// Scales the whole overlay (background and grid together) about its
+    /// center. Only a presentation-layer animation is added — the layer's
+    /// model transform stays identity, so AppKit's own management of the
+    /// view's layer geometry is never fought with. `holdAtEnd` keeps the
+    /// final scale applied after the animation (for dismissal, until the
+    /// window has been ordered out).
+    private func animateZoom(from: CGFloat, to: CGFloat, duration: CFTimeInterval, timing: CAMediaTimingFunctionName, holdAtEnd: Bool) {
+        guard let layer = backgroundContainer.layer else { return }
+        layer.removeAnimation(forKey: Self.zoomAnimationKey)
+
+        // AppKit-managed layers usually anchor at (0,0), so scaling about
+        // the center means translating there first; derived from the actual
+        // anchor point rather than assuming it.
+        let bounds = layer.bounds
+        let dx = (0.5 - layer.anchorPoint.x) * bounds.width
+        let dy = (0.5 - layer.anchorPoint.y) * bounds.height
+        func transform(_ scale: CGFloat) -> CATransform3D {
+            var t = CATransform3DMakeTranslation(dx, dy, 0)
+            t = CATransform3DScale(t, scale, scale, 1)
+            return CATransform3DTranslate(t, -dx, -dy, 0)
+        }
+
+        let animation = CABasicAnimation(keyPath: "transform")
+        animation.fromValue = NSValue(caTransform3D: transform(from))
+        animation.toValue = NSValue(caTransform3D: transform(to))
+        animation.duration = duration
+        animation.timingFunction = CAMediaTimingFunction(name: timing)
+        if holdAtEnd {
+            animation.fillMode = .forwards
+            animation.isRemovedOnCompletion = false
+        }
+        layer.add(animation, forKey: Self.zoomAnimationKey)
+    }
+
+    /// Fades out and orders the window out. The hosted grid stays mounted so
+    /// the next `show(with:)` doesn't have to rebuild it.
     func dismiss() {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
@@ -229,11 +277,11 @@ final class LaunchpadOverlayWindow: NSWindow {
         operationToken += 1
         let token = operationToken
 
-        NSAnimationContext.runAnimationGroup({ [zoomedOutFrame] context in
+        animateZoom(from: 1, to: Self.zoomedOutScale, duration: 0.18, timing: .easeIn, holdAtEnd: true)
+        NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.18
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             animator().alphaValue = 0
-            animator().setFrame(zoomedOutFrame, display: true)
         }, completionHandler: { [weak self] in
             // If a newer `show()` (or another `dismiss()`) has run since
             // this one started, this completion is stale — the window is
@@ -242,8 +290,7 @@ final class LaunchpadOverlayWindow: NSWindow {
             // this call's own leftovers.
             guard let self, self.operationToken == token else { return }
             self.orderOut(nil)
-            self.hostingView?.removeFromSuperview()
-            self.hostingView = nil
+            self.backgroundContainer.layer?.removeAnimation(forKey: Self.zoomAnimationKey)
             self.onRequestDismiss = nil
         })
     }

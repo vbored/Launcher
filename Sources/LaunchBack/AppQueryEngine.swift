@@ -7,8 +7,15 @@ struct AppInfo: Identifiable, Hashable, @unchecked Sendable {
     let name: String
     let bundleURL: URL
     let icon: NSImage
+    // Modification date of the bundle's Info.plist — an app update rewrites
+    // it, so an unchanged stamp means the already-loaded name and icon are
+    // still correct and can be reused instead of reloaded.
+    let stamp: Date?
 
-    static func == (lhs: AppInfo, rhs: AppInfo) -> Bool { lhs.id == rhs.id }
+    // Includes `stamp` so an in-place app update (same id, new icon/name)
+    // still registers as a change to `store.apps`; hashing stays id-only,
+    // which is consistent since equal values always share an id.
+    static func == (lhs: AppInfo, rhs: AppInfo) -> Bool { lhs.id == rhs.id && lhs.stamp == rhs.stamp }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
@@ -213,11 +220,21 @@ final class AppQueryEngine {
         }
         query.enableUpdates()
 
+        // This runs every 20s (fallback timer) and on every Spotlight update
+        // — which, with local-computer scope, fires for *any* .app bundle
+        // changing anywhere, Xcode build products included. It used to
+        // reload every icon each time and republish the whole list, handing
+        // the grid brand-new `NSImage`s whose pixels then had to be decoded
+        // on the main thread on the next open. Now unchanged apps are reused
+        // as-is and nothing is published unless something actually changed.
+        let known = Dictionary(store.apps.map { ($0.bundleURL.path, $0) }, uniquingKeysWith: { first, _ in first })
+
         enrichmentTask?.cancel()
         enrichmentTask = Task {
-            let infos = await Self.loadAll(urls: urls)
+            let infos = await Self.loadAll(urls: urls, reusing: known)
             guard !Task.isCancelled else { return }
             self.hasReceivedLiveResults = true
+            guard infos != store.apps else { return }
             store.apps = infos
             Self.saveCachedPaths(infos.map { $0.bundleURL.path })
         }
@@ -236,13 +253,15 @@ final class AppQueryEngine {
         try? data.write(to: cacheURL, options: .atomic)
     }
 
-    private static func loadAll(urls: [URL]) async -> [AppInfo] {
+    // `nonisolated` so collecting and sorting the results happens off the
+    // main thread too, not just the per-app loading inside the task group.
+    nonisolated private static func loadAll(urls: [URL], reusing known: [String: AppInfo] = [:]) async -> [AppInfo] {
         var seenIdentifiers = Set<String>()
         var results: [AppInfo] = []
 
         await withTaskGroup(of: AppInfo?.self) { group in
             for url in urls {
-                group.addTask { loadAppInfo(at: url) }
+                group.addTask { loadAppInfo(at: url, reusing: known[url.path]) }
             }
             for await info in group {
                 guard let info else { continue }
@@ -263,8 +282,14 @@ final class AppQueryEngine {
     // would serialize every one of those calls onto the main thread despite
     // the surrounding concurrency, which is exactly the mistake that made
     // large `/Applications` folders slow to scan before.
-    nonisolated private static func loadAppInfo(at url: URL) -> AppInfo? {
-        guard let data = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist")),
+    nonisolated private static func loadAppInfo(at url: URL, reusing known: AppInfo?) -> AppInfo? {
+        let plistURL = url.appendingPathComponent("Contents/Info.plist")
+        let stamp = (try? plistURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        if let known, let stamp, known.stamp == stamp {
+            return known
+        }
+
+        guard let data = try? Data(contentsOf: plistURL),
               let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
         else { return nil }
 
@@ -282,9 +307,56 @@ final class AppQueryEngine {
             ?? (info["CFBundleName"] as? String)
             ?? url.deletingPathExtension().lastPathComponent
 
-        let image = NSWorkspace.shared.icon(forFile: url.path)
-        image.size = NSSize(width: 128, height: 128)
+        return AppInfo(
+            id: identifier,
+            name: displayName,
+            bundleURL: url,
+            icon: rasterizedIcon(forFile: url.path),
+            stamp: stamp
+        )
+    }
 
-        return AppInfo(id: identifier, name: displayName, bundleURL: url, icon: image)
+    /// Covers the largest on-screen icon size (~128-140pt) at 2x.
+    nonisolated private static let iconPixelSize = 256
+
+    /// `NSWorkspace.icon(forFile:)` hands back a lazy, multi-representation
+    /// image — the actual `.icns` decode and rasterization doesn't happen
+    /// until something first draws it, which was the grid, on the main
+    /// thread, for every visible icon at once, during the open animation.
+    /// Drawing it into a fixed-size bitmap here does that work now, on the
+    /// background task-group thread, so the grid only ever composites an
+    /// already-decoded bitmap.
+    nonisolated private static func rasterizedIcon(forFile path: String) -> NSImage {
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        let pointSize = NSSize(width: 128, height: 128)
+        let side = iconPixelSize
+
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.displayP3),
+              let context = CGContext(
+                  data: nil,
+                  width: side,
+                  height: side,
+                  bitsPerComponent: 8,
+                  bytesPerRow: 0,
+                  space: colorSpace,
+                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+              )
+        else {
+            icon.size = pointSize
+            return icon
+        }
+
+        // The current graphics context is per-thread, so this is safe to
+        // run concurrently across the task group.
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        icon.draw(in: NSRect(x: 0, y: 0, width: side, height: side))
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let cgImage = context.makeImage() else {
+            icon.size = pointSize
+            return icon
+        }
+        return NSImage(cgImage: cgImage, size: pointSize)
     }
 }
