@@ -40,7 +40,6 @@ struct GridView: View {
 
     @State private var currentPage: Int?
     @State private var launchingID: String?
-    @State private var hoveredID: String?
     @State private var searchText = ""
     @FocusState private var searchFocused: Bool
 
@@ -83,7 +82,7 @@ struct GridView: View {
     /// pulled out so the folder-detail overlay can compute the identical
     /// icon size for the same screen instead of a separately-tuned
     /// constant that only happened to look right on one reference display.
-    private static func mainGridMetrics(contentWidth: CGFloat, columns: Int) -> (cellWidth: CGFloat, iconSize: CGFloat) {
+    fileprivate static func mainGridMetrics(contentWidth: CGFloat, columns: Int) -> (cellWidth: CGFloat, iconSize: CGFloat) {
         let horizontalSpacing: CGFloat = 32
         let cellWidth = (contentWidth - horizontalSpacing * CGFloat(columns - 1)) / CGFloat(columns)
         // 0.45 undershot next to the reference once rendered — bumped to
@@ -136,10 +135,29 @@ struct GridView: View {
                             // glitch. Laying out every page up front avoids
                             // that entirely, at negligible memory cost.
                             HStack(spacing: 0) {
-                                ForEach(Array(pages.enumerated()), id: \.offset) { index, pageApps in
-                                    pageGrid(pageApps, containerWidth: contentWidth, containerHeight: geo.size.height)
-                                        .containerRelativeFrame(.horizontal)
-                                        .id(index)
+                                ForEach(Array(pages.enumerated()), id: \.offset) { index, pageItems in
+                                    PageGrid(
+                                        items: pageItems,
+                                        containerWidth: contentWidth,
+                                        containerHeight: geo.size.height,
+                                        columns: columns,
+                                        rows: rows,
+                                        launchingID: launchingID.flatMap { id in pageItems.contains { $0.id == id } ? id : nil },
+                                        folderPreviews: folderPreviews(for: pageItems),
+                                        onLaunch: { launch($0) },
+                                        onOpenFolder: { openFolderID = $0 },
+                                        onDrop: { handleDrop(providers: $0, onto: $1) },
+                                        onDismiss: onDismiss
+                                    )
+                                    // Every page is laid out up front (see
+                                    // above), so without this any change at
+                                    // all to `GridView` — opening, a search
+                                    // reset, a launch — re-diffed every icon on
+                                    // every page. `.equatable()` lets a page
+                                    // whose own inputs didn't change skip that.
+                                    .equatable()
+                                    .containerRelativeFrame(.horizontal)
+                                    .id(index)
                                 }
                             }
                             .scrollTargetLayout()
@@ -274,13 +292,26 @@ struct GridView: View {
     /// What a freshly built `GridView` used to get for free on every open.
     /// `launchingID` matters most: `launch` refuses to run while it's set,
     /// so leaving it over from the previous open would block every launch.
+    ///
+    /// Each assignment is guarded so an open that finds things already in
+    /// their reset state (the common case) doesn't invalidate any views.
     private func resetForNewPresentation() {
-        openFolderID = nil
-        launchingID = nil
-        hoveredID = nil
-        searchText = ""
-        currentPage = 0
-        searchFocused = true
+        if openFolderID != nil { openFolderID = nil }
+        if launchingID != nil { launchingID = nil }
+        if !searchText.isEmpty { searchText = "" }
+        if (currentPage ?? 0) != 0 { currentPage = 0 }
+        if !searchFocused { searchFocused = true }
+    }
+
+    /// Resolved folder contents for just the folders on one page — what that
+    /// page's folder icons preview, and part of what `PageGrid` compares to
+    /// decide whether it needs to re-render.
+    private func folderPreviews(for pageItems: [LaunchItem]) -> [UUID: [AppInfo]] {
+        var previews: [UUID: [AppInfo]] = [:]
+        for case .folder(let folder) in pageItems {
+            previews[folder.id] = apps(in: folder)
+        }
+        return previews
     }
 
     private func recomputePages() {
@@ -354,93 +385,6 @@ struct GridView: View {
         }
     }
 
-    /// Icons scale with the available cell width instead of a fixed size,
-    /// so they fill their grid cell the way classic Launchpad's do rather
-    /// than looking small and lost on wide/high-column-count screens.
-    ///
-    /// `containerWidth` here is already the narrowed, framed content width
-    /// (the caller constrains the ScrollView itself to ~68% of the screen)
-    /// — this just fills it edge to edge, with no additional margin of its
-    /// own, so adjacent pages sit flush against each other with no gap
-    /// during a swipe.
-    @ViewBuilder
-    private func pageGrid(_ pageItems: [LaunchItem], containerWidth: CGFloat, containerHeight: CGFloat) -> some View {
-        let horizontalSpacing: CGFloat = 32
-        let (cellWidth, iconSize) = Self.mainGridMetrics(contentWidth: containerWidth, columns: columns)
-
-        // Row spacing was a fixed 32pt regardless of available height, so 5
-        // rows never filled the space — everything stayed top-aligned with
-        // a big dead gap before the page dots instead of extending closer
-        // to them like real Launchpad's. Deriving it from `containerHeight`
-        // the same way column width is derived from `containerWidth` makes
-        // the 5 rows actually fill the vertical space.
-        let topInset: CGFloat = 40
-        let bottomReserve: CGFloat = 48 // room for the page-dot row below
-        let labelHeight: CGFloat = 16
-        let iconLabelGap: CGFloat = 8
-        let rowContentHeight = iconSize + iconLabelGap + labelHeight
-        let availableForRows = max(containerHeight - topInset - bottomReserve, rowContentHeight * CGFloat(rows))
-        let rowPitch = availableForRows / CGFloat(rows)
-        let verticalSpacing = max(rowPitch - rowContentHeight, horizontalSpacing)
-
-        // The tap-to-dismiss catcher lives here (on the grid content) and
-        // not on the ScrollView above: stacking a plain `.onTapGesture`
-        // directly alongside the ScrollView's `.simultaneousGesture(
-        // DragGesture)` reliably broke rendering (confirmed by bisection —
-        // the whole overlay stopped compositing at all, even though every
-        // Swift-level call still returned normally). Putting it on a
-        // separate, more deeply nested view avoids the conflict entirely,
-        // and still covers the gaps between icons — the vast majority of
-        // the "empty" area a user would actually click.
-        LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: horizontalSpacing), count: columns),
-            spacing: verticalSpacing
-        ) {
-            ForEach(pageItems) { item in
-                Group {
-                    switch item {
-                    case .app(let app):
-                        AppIconView(
-                            app: app,
-                            iconSize: iconSize,
-                            labelWidth: cellWidth,
-                            isHovered: hoveredID == app.id,
-                            isLaunching: launchingID == app.id
-                        )
-                        .onHover { hoveredID = $0 ? app.id : nil }
-                        .onTapGesture { launch(app) }
-                        // Only loose apps are draggable — dragging an
-                        // existing folder isn't supported (reordering
-                        // folders isn't the ask here; grouping apps is).
-                        // The payload is just the bundle identifier as
-                        // plain text, read back out in `handleDrop`.
-                        .onDrag { NSItemProvider(object: app.id as NSString) }
-                    case .folder(let folder):
-                        FolderIconView(
-                            folder: folder,
-                            previewApps: apps(in: folder),
-                            iconSize: iconSize,
-                            labelWidth: cellWidth,
-                            isHovered: hoveredID == item.id
-                        )
-                        .onHover { hoveredID = $0 ? item.id : nil }
-                        .onTapGesture { openFolderID = folder.id }
-                    }
-                }
-                // Every icon — app or folder — is a valid drop target: an
-                // app dropped on another app spins up a new folder, an app
-                // dropped on a folder joins it.
-                .onDrop(of: [.text], isTargeted: nil) { providers in
-                    handleDrop(providers: providers, onto: item)
-                }
-            }
-        }
-        .padding(.top, topInset)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onDismiss)
-    }
-
     /// Reads the dragged app's identifier back out of the drop's
     /// `NSItemProvider` and, once resolved, either folds it into an
     /// existing folder or spins up a brand new one — classic Launchpad's
@@ -485,6 +429,150 @@ struct GridView: View {
         ) { _, _ in }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: onDismiss)
+    }
+}
+
+/// Icons scale with the available cell width instead of a fixed size,
+/// so they fill their grid cell the way classic Launchpad's do rather
+/// than looking small and lost on wide/high-column-count screens.
+///
+/// `containerWidth` here is already the narrowed, framed content width
+/// (the caller constrains the ScrollView itself to ~68% of the screen)
+/// — this just fills it edge to edge, with no additional margin of its
+/// own, so adjacent pages sit flush against each other with no gap
+/// during a swipe.
+///
+/// A standalone `Equatable` view (rather than a `GridView` method) so
+/// SwiftUI can skip re-rendering a page whose own contents haven't changed —
+/// see `.equatable()` at the call site. Only data is compared; the action
+/// closures are always equivalent, since they act through `GridView`'s state
+/// storage rather than capturing any of its values.
+private struct PageGrid: View, Equatable {
+    let items: [LaunchItem]
+    let containerWidth: CGFloat
+    let containerHeight: CGFloat
+    let columns: Int
+    let rows: Int
+    // Only non-nil when the launching app is on this page, so a launch
+    // re-renders just the one page it happened on.
+    let launchingID: String?
+    let folderPreviews: [UUID: [AppInfo]]
+    let onLaunch: (AppInfo) -> Void
+    let onOpenFolder: (UUID) -> Void
+    let onDrop: ([NSItemProvider], LaunchItem) -> Bool
+    let onDismiss: () -> Void
+
+    static func == (lhs: PageGrid, rhs: PageGrid) -> Bool {
+        lhs.items == rhs.items
+            && lhs.containerWidth == rhs.containerWidth
+            && lhs.containerHeight == rhs.containerHeight
+            && lhs.launchingID == rhs.launchingID
+            && lhs.folderPreviews == rhs.folderPreviews
+    }
+
+    var body: some View {
+        let horizontalSpacing: CGFloat = 32
+        let (cellWidth, iconSize) = GridView.mainGridMetrics(contentWidth: containerWidth, columns: columns)
+
+        // Row spacing was a fixed 32pt regardless of available height, so 5
+        // rows never filled the space — everything stayed top-aligned with
+        // a big dead gap before the page dots instead of extending closer
+        // to them like real Launchpad's. Deriving it from `containerHeight`
+        // the same way column width is derived from `containerWidth` makes
+        // the 5 rows actually fill the vertical space.
+        let topInset: CGFloat = 40
+        let bottomReserve: CGFloat = 48 // room for the page-dot row below
+        let labelHeight: CGFloat = 16
+        let iconLabelGap: CGFloat = 8
+        let rowContentHeight = iconSize + iconLabelGap + labelHeight
+        let availableForRows = max(containerHeight - topInset - bottomReserve, rowContentHeight * CGFloat(rows))
+        let rowPitch = availableForRows / CGFloat(rows)
+        let verticalSpacing = max(rowPitch - rowContentHeight, horizontalSpacing)
+
+        // The tap-to-dismiss catcher lives here (on the grid content) and
+        // not on the ScrollView above: stacking a plain `.onTapGesture`
+        // directly alongside the ScrollView's `.simultaneousGesture(
+        // DragGesture)` reliably broke rendering (confirmed by bisection —
+        // the whole overlay stopped compositing at all, even though every
+        // Swift-level call still returned normally). Putting it on a
+        // separate, more deeply nested view avoids the conflict entirely,
+        // and still covers the gaps between icons — the vast majority of
+        // the "empty" area a user would actually click.
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: horizontalSpacing), count: columns),
+            spacing: verticalSpacing
+        ) {
+            ForEach(items) { item in
+                Group {
+                    switch item {
+                    case .app(let app):
+                        HoverableAppIcon(
+                            app: app,
+                            iconSize: iconSize,
+                            labelWidth: cellWidth,
+                            isLaunching: launchingID == app.id
+                        )
+                        .onTapGesture { onLaunch(app) }
+                        // Only loose apps are draggable — dragging an
+                        // existing folder isn't supported (reordering
+                        // folders isn't the ask here; grouping apps is).
+                        // The payload is just the bundle identifier as
+                        // plain text, read back out in `handleDrop`.
+                        .onDrag { NSItemProvider(object: app.id as NSString) }
+                    case .folder(let folder):
+                        HoverableFolderIcon(
+                            folder: folder,
+                            previewApps: folderPreviews[folder.id] ?? [],
+                            iconSize: iconSize,
+                            labelWidth: cellWidth
+                        )
+                        .onTapGesture { onOpenFolder(folder.id) }
+                    }
+                }
+                // Every icon — app or folder — is a valid drop target: an
+                // app dropped on another app spins up a new folder, an app
+                // dropped on a folder joins it.
+                .onDrop(of: [.text], isTargeted: nil) { providers in
+                    onDrop(providers, item)
+                }
+            }
+        }
+        .padding(.top, topInset)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onDismiss)
+    }
+}
+
+/// Hover is tracked per icon rather than as one `hoveredID` on `GridView`:
+/// at grid level, every mouse-over (including the burst of enter/exit events
+/// when the overlay appears under the cursor) re-evaluated every icon on
+/// every page instead of just the two whose hover state actually changed.
+private struct HoverableAppIcon: View {
+    let app: AppInfo
+    let iconSize: CGFloat
+    let labelWidth: CGFloat
+    let isLaunching: Bool
+
+    @State private var isHovered = false
+
+    var body: some View {
+        AppIconView(app: app, iconSize: iconSize, labelWidth: labelWidth, isHovered: isHovered, isLaunching: isLaunching)
+            .onHover { isHovered = $0 }
+    }
+}
+
+private struct HoverableFolderIcon: View {
+    let folder: AppFolder
+    let previewApps: [AppInfo]
+    let iconSize: CGFloat
+    let labelWidth: CGFloat
+
+    @State private var isHovered = false
+
+    var body: some View {
+        FolderIconView(folder: folder, previewApps: previewApps, iconSize: iconSize, labelWidth: labelWidth, isHovered: isHovered)
+            .onHover { isHovered = $0 }
     }
 }
 
@@ -625,25 +713,68 @@ private struct MouseDragPager: NSViewRepresentable {
 }
 
 /// `.scrollIndicators(.hidden)` only suppresses the modern overlay
-/// scroller; when the system-wide "Show scroll bars: Always" preference is
-/// on, AppKit falls back to a legacy `NSScroller` that ignores it. This
-/// reaches into the `ScrollView`'s backing `NSScrollView` and turns the
-/// scroller off directly so no track/thumb is ever drawn.
+/// scroller; whenever AppKit uses a legacy `NSScroller` instead — "Show
+/// scroll bars: Always", or "Automatically" with a mouse connected — it
+/// ignores that and draws a full track and thumb under the grid. This
+/// reaches into the `ScrollView`'s backing `NSScrollView` and gets rid of it.
+///
+/// Turning `hasHorizontalScroller` off once wasn't enough: SwiftUI
+/// reconfigures its scroll view later (e.g. when pages load and
+/// `scrollDisabled` flips) and turns the scroller back on. So the scrollers
+/// are also swapped for a zero-width, never-drawn one — even if SwiftUI
+/// re-enables them, there's nothing to show — and both properties are
+/// watched so any later reset gets undone.
 private struct ScrollbarHider: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async { hideScrollers(from: view) }
-        return view
+    func makeNSView(context: Context) -> HiderView { HiderView() }
+
+    func updateNSView(_ nsView: HiderView, context: Context) {
+        nsView.hideScrollers()
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        hideScrollers(from: nsView)
+    final class HiderView: NSView {
+        private var observations: [NSKeyValueObservation] = []
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            hideScrollers()
+        }
+
+        func hideScrollers() {
+            guard let scrollView = enclosingScrollView else { return }
+            if !(scrollView.horizontalScroller is InvisibleScroller) {
+                scrollView.horizontalScroller = InvisibleScroller()
+            }
+            if !(scrollView.verticalScroller is InvisibleScroller) {
+                scrollView.verticalScroller = InvisibleScroller()
+            }
+            if scrollView.hasHorizontalScroller { scrollView.hasHorizontalScroller = false }
+            if scrollView.hasVerticalScroller { scrollView.hasVerticalScroller = false }
+
+            guard observations.isEmpty else { return }
+            let reapply: (NSScrollView) -> Void = { [weak self] _ in
+                DispatchQueue.main.async { self?.hideScrollers() }
+            }
+            observations = [
+                scrollView.observe(\.hasHorizontalScroller) { view, _ in reapply(view) },
+                scrollView.observe(\.hasVerticalScroller) { view, _ in reapply(view) },
+                scrollView.observe(\.horizontalScroller) { view, _ in reapply(view) },
+                scrollView.observe(\.verticalScroller) { view, _ in reapply(view) },
+            ]
+        }
     }
 
-    private func hideScrollers(from view: NSView) {
-        guard let scrollView = view.enclosingScrollView else { return }
-        scrollView.hasHorizontalScroller = false
-        scrollView.hasVerticalScroller = false
+    /// Takes up no space and draws nothing, for whichever scroller style
+    /// AppKit picks.
+    final class InvisibleScroller: NSScroller {
+        override class var isCompatibleWithOverlayScrollers: Bool { true }
+
+        override class func scrollerWidth(for controlSize: NSControl.ControlSize, scrollerStyle: NSScroller.Style) -> CGFloat {
+            0
+        }
+
+        override func draw(_ dirtyRect: NSRect) {}
+        override func drawKnob() {}
+        override func drawKnobSlot(in slotRect: NSRect, highlight flag: Bool) {}
     }
 }
 
